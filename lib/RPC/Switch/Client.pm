@@ -1,7 +1,7 @@
 package RPC::Switch::Client;
 use Mojo::Base 'Mojo::EventEmitter';
 
-our $VERSION = '0.12'; # VERSION
+our $VERSION = '0.17'; # VERSION
 
 #
 # Mojo's default reactor uses EV, and EV does not play nice with signals
@@ -11,8 +11,6 @@ our $VERSION = '0.12'; # VERSION
 BEGIN {
 	$ENV{'MOJO_REACTOR'} = 'Mojo::Reactor::Poll' unless $ENV{'MOJO_REACTOR'};
 }
-
-use feature 'state';
 
 # more Mojolicious
 use Mojo::IOLoop;
@@ -28,11 +26,12 @@ use Encode qw(encode_utf8 decode_utf8);
 use File::Basename;
 use IO::Handle;
 use POSIX ();
+use Scalar::Util qw(blessed refaddr);
 use Storable;
 use Sys::Hostname;
 
 # from cpan
-use JSON::RPC2::TwoWay 0.03; # for access to the request
+use JSON::RPC2::TwoWay 0.04; # for access to the request
 # JSON::RPC2::TwoWay depends on JSON::MaybeXS anyways, so it can be used here
 # without adding another dependency
 use JSON::MaybeXS;
@@ -40,8 +39,9 @@ use MojoX::NetstringStream 0.06;
 
 
 has [qw(
-	actions address auth channels clientid conn debug json lastping
-	log method ns ping_timeout port rpc timeout tls token who
+	actions address auth cb_used channels clientid conn debug ioloop
+	json lastping log method ns ping_timeout port rpc timeout tls token
+	who
 )];
 
 # keep in sync with the rpc-switch
@@ -61,14 +61,16 @@ sub new {
 	my $self = $class->SUPER::new();
 
 	my $debug = $args{debug} // 0; # or 1?
-	my $log = $args{log} // Mojo::Log->new(level => ($debug) ? 'debug' : 'info');
 
 	$self->{address} = $args{address} // '127.0.0.1';
+	$self->{cb_used} = {}; # avoid calling cb twice in a timeout scenario
 	$self->{channels} = {}; # per channel hash of waitids
 	$self->{debug} = $debug;
 	$self->{json} = $args{json} // 1;
 	$self->{ping_timeout} = $args{ping_timeout} // 300;
-	$self->{log} = $log;
+	$self->{ioloop} = $args{ioloop} // Mojo::IOLoop->singleton;
+	$self->{log} = $args{log}
+		// Mojo::Log->new(level => ($debug) ? 'debug' : 'info');
 	$self->{method} = $args{method} // 'password';
 	$self->{port} = $args{port} // 6551;
 	$self->{timeout} = $args{timeout} // 60;
@@ -91,14 +93,14 @@ sub new {
 sub connect {
 	my $self = shift;
 
-	delete $self->{_exit};
+	delete $self->ioloop->{__exit__};
 	delete $self->{auth};
 	$self->{actions} = {};
 
 	$self->on(disconnect => sub {
 		my ($self, $code) = @_;
-		$self->{_exit} = $code;
-		Mojo::IOLoop->stop;
+		#$self->{_exit} = $code;
+		$self->ioloop->stop;
 	});
 
 	my $rpc = JSON::RPC2::TwoWay->new(debug => $self->{debug}) or croak 'no rpc?';
@@ -122,12 +124,12 @@ sub connect {
 	$clarg->{tls_cert} = $self->{tls_cert} if $self->{tls_cert};
 	$clarg->{tls_key} = $self->{tls_key} if $self->{tls_key};
 
-	my $clientid = Mojo::IOLoop->client(
+	my $clientid = $self->ioloop->client(
 		$clarg => sub {
 		my ($loop, $err, $stream) = @_;
 		if ($err) {
 			$err =~ s/\n$//s;
-			$self->log->info('connection to API failed: ' . $err);
+			$self->log->error('connection to API failed: ' . $err);
 			$self->{auth} = 0;
 			return;
 		}
@@ -151,7 +153,7 @@ sub connect {
 			# Mojo::Util::_global_destruction() won't work
 			return unless $conn;
 			$conn->close;
-			$self->log->info('connection to rpcswitch closed');
+			$self->log->warn('connection to rpcswitch closed');
 			$self->emit(disconnect => WORK_CONNECTION_CLOSED); # todo: doc
 		});
 	});
@@ -160,7 +162,7 @@ sub connect {
 	$self->{clientid} = $clientid;
 
 	# handle timeout?
-	my $tmr = Mojo::IOLoop->timer($self->{timeout} => sub {
+	my $tmr = $self->ioloop->timer($self->{timeout} => sub {
 		my $loop = shift;
 		$self->log->error('timeout wating for greeting');
 		$loop->remove($clientid); # disconnect
@@ -174,19 +176,20 @@ sub connect {
 
 	$self->log->debug('done with handhake?');
 
-	Mojo::IOLoop->remove($tmr);
+	$self->ioloop->remove($tmr);
+	$self->unsubscribe('disconnect');
 
 	return $self->{auth};
 }
 
 sub is_connected {
 	my $self = shift;
-	return $self->{auth} && !$self->{_exit};
+	return $self->{auth} && !$self->ioloop->{__exit__};
 }
 
 sub rpc_greetings {
 	my ($self, $c, $i) = @_;
-	Mojo::IOLoop->delay(
+	$self->ioloop->delay(
 		sub {
 			my $d = shift;
 			die "wrong api version $i->{version} (expected 1.0)" unless $i->{version} eq '1.0';
@@ -220,9 +223,12 @@ sub call {
 	my ($done, $status, $outargs);
 	$args{waitcb} = sub {
 		($status, $outargs) = @_;
-		die "unexpected status" unless $status and $status eq RES_WAIT;
+		unless ($status and $status eq RES_WAIT) {
+			$self->log->error('unexpected status: ' . ($status // 'undef'));
+			$done++;
+			return;
+		}
 		$self->log->debug("gotta wait for $outargs");
-		#$done++ unless $status and $status eq RES_WAIT;
 	};
 	$args{resultcb} = sub {
 		($status, $outargs) = @_;
@@ -250,33 +256,47 @@ sub call_nb {
 		$inargsj = $inargs;
 		$inargs = decode_json($inargs);
 		croak 'inargs is not a json object' unless ref $inargs eq 'HASH';
-		if ($reqauth) {
-			$reqauth = decode_json($reqauth);
-			croak 'reqauth is not a json object' unless ref $reqauth eq 'HASH';
-		}
 	} else {
 		croak 'inargs should be a hashref' unless ref $inargs eq 'HASH';
 		# test encoding
 		$inargsj = encode_json($inargs);
 		if ($reqauth) {
-			croak 'reqauth should be a hashref' unless ref $reqauth eq 'HASH';
 		}
+	}
+
+	if ($reqauth) {
+		if (blessed($reqauth)) {
+			if ($reqauth->can('_to_reqauth')) {
+				# duck typing in action
+				$reqauth = $reqauth->_to_reqauth();
+			} else {
+				croak "Don't know how to convert $reqauth to reqauth hash";
+			}
+		}
+		croak 'reqauth should be a hashref' unless ref $reqauth eq 'HASH';
+	}
+
+	if ($timeout > 0) {
+		$self->ioloop->timer($timeout => sub {
+			$rescb->(RES_TIMEOUT, "timed out after $timeout seconds");
+			$self->{cb_used}->{refaddr($rescb)} = 1
+				if defined $self->{cb_used}->{refaddr($rescb)};
+				# waiting for result notification after RES_WAIT
+			$rescb = undef;
+		});
 	}
 
 	$inargsj = decode_utf8($inargsj);
 	$self->log->debug("calling $method with '" . $inargsj . "'" . (($vtag) ? " (vtag $vtag)" : ''));
 
-	my $delay = Mojo::IOLoop->delay->steps(
+	my $delay = $self->ioloop->delay( #->steps(
 		sub {
 			my $d = shift;
-			my $end = $d->begin(0);
-			if ($timeout > 0) {
-				Mojo::IOLoop->timer($timeout => sub { 
-					$d->pass(undef, {result => [RES_TIMEOUT, {}]});
-					$end->(); 
-				});
-			}
-			$self->conn->call($method, $inargs, $end, 1);
+			$self->conn->callraw({
+				method => $method,
+				params => $inargs,
+				($reqauth ? (rpcswitch => { vcookie => 'eatme', reqauth => $reqauth }) : ()),
+			}, $d->begin(0));
 		},
 		sub {
 			#print Dumper(@_);
@@ -284,9 +304,10 @@ sub call_nb {
 			if ($e) {
 				$e = $e->{error};
 				$self->log->error("call returned error: $e->{message} ($e->{code})");
-				$rescb->(RES_ERROR, "$e->{message} ($e->{code})");
+				$rescb->(RES_ERROR, "$e->{message} ($e->{code})") if $rescb;
 				return;
 			}
+			return unless $rescb; # $rescb is undef if a timeout happeded
 			my ($status, $outargs) = @{$r->{result}};
 			if ($status eq RES_WAIT) {
 				#print '@$r', Dumper($r);
@@ -301,6 +322,7 @@ sub call_nb {
 				# outargs should contain waitid
 				# autovivification ftw?
 				$self->{channels}->{$vci}->{$outargs} = $rescb;
+				$self->{cb_used}->{refaddr($rescb)} = 0;
 				$waitcb->($status, $outargs) if $waitcb;
 			} else {
 				$outargs = encode_json($outargs) if $self->{json} and ref $outargs;
@@ -353,13 +375,14 @@ sub get_status {
 
 sub rpc_result {
 	my ($self, $c, $r) = @_;
-	#$self->log->error('got result: ' . Dumper($r));
+	#$self->log->debug('got result: ' . Dumper($r));
 	my ($status, $id, $outargs) = @{$r->{params}};
 	return unless $id;
 	my $vci = $r->{rpcswitch}->{vci};
 	return unless $vci;
 	my $rescb = delete $self->{channels}->{$vci}->{$id};
 	return unless $rescb;
+	return if delete $self->{cb_used}->{refaddr($rescb)}; # cb already called
 	$outargs = encode_json($outargs) if $self->{json} and ref $outargs;
 	$rescb->($status, $outargs);
 	return;
@@ -384,7 +407,7 @@ sub ping {
 	$timeout //= $self->timeout;
 	my ($done, $ret);
 
-	Mojo::IOLoop->timer($timeout => sub {
+	$self->ioloop->timer($timeout => sub {
 		$done++;
 	});
 
@@ -405,35 +428,40 @@ sub ping {
 }
 
 sub work {
-	my ($self) = @_;
+	my ($self, $prepare) = @_;
 
 	my $pt = $self->ping_timeout;
 	my $tmr;
-	$tmr = Mojo::IOLoop->recurring($pt => sub {
+	$tmr = $self->ioloop->recurring($pt => sub {
 		my $ioloop = shift;
 		$self->log->debug('in ping_timeout timer: lastping: '
 			 . ($self->lastping // 0) . ' limit: ' . (time - $pt) );
 		return if ($self->lastping // 0) > time - $pt;
 		$self->log->error('ping timeout');
 		$ioloop->remove($self->clientid);
-		$self->{_exit} = WORK_PING_TIMEOUT; # todo: doc
-		$ioloop->stop;
 		$ioloop->remove($tmr);
+		$ioloop->{__exit__} = WORK_PING_TIMEOUT; # todo: doc
+		$ioloop->stop;
 	}) if $pt > 0;
-
-	$self->{_exit} = WORK_OK;
+	$self->on(disconnect => sub {
+		my ($self, $code) = @_;
+		$self->ioloop->{__exit__} = $code;
+		$self->ioloop->stop;
+	});
+	return 0 if $prepare;
+	$self->ioloop->{__exit__} = WORK_OK;
 	$self->log->debug(blessed($self) . ' starting work');
-	Mojo::IOLoop->start unless Mojo::IOLoop->is_running;
+	$self->ioloop->start unless $self->ioloop->is_running;
 	$self->log->debug(blessed($self) . ' done?');
-	Mojo::IOLoop->remove($tmr) if $tmr;
+	$self->ioloop->remove($tmr) if $tmr;
 
-	return $self->{_exit};
+	return $self->ioloop->{__exit__};
 }
 
 sub stop {
 	my ($self, $exit) = @_;
-	$self->{_exit} = $exit;
-	Mojo::IOLoop->stop;
+	$self->ioloop->{__exit__} = $exit;
+	$self->ioloop->stop;
 }
 
 sub announce {
@@ -443,14 +471,13 @@ sub announce {
 	#my $async = $args{async} // 0;
 	my $mode = $args{mode} // (($args{async}) ? 'async' : 'sync');
 	croak "unknown callback mode $mode" unless $mode =~ /^(subproc|async|async2|sync)$/;
-	my $undocb = $args{undocb};
 	my $host = hostname;
 	my $workername = $args{workername} // "$self->{who} $host $0 $$";
 	
 	croak "already have action $method" if $self->actions->{$method};
 	
 	my $err;
-	Mojo::IOLoop->delay->steps(
+	$self->ioloop->delay( #->steps(
 	sub {
 		my $d = shift;
 		# fixme: check results?
@@ -475,11 +502,12 @@ sub announce {
 			$self->log->error("announce got res: $res msg: $msg");
 			return;
 		}
-                my $worker_id = $msg->{worker_id};
+		my $worker_id = $msg->{worker_id};
 		my $action = {
 			cb => $cb,
 			mode => $mode,
-			undocb => $undocb,
+			undocb => $args{undocb},
+			meta => $args{meta},
 			worker_id => $worker_id,
 		};
 		$self->actions->{$method} = $action;
@@ -509,7 +537,6 @@ sub _magic {
 	my ($self, $action, $con, $request, $rpccb) = @_;
 	my $method = $request->{method};
 	my $req_id = $request->{id};
-	my $params = $request->{params};
 	unless ($action) {
 		$self->log->info("_magic for unknown action $method");
 		return;
@@ -526,6 +553,8 @@ sub _magic {
 		$resp->{result} = \@_;
 		$rpccb->($resp);
 	};
+	my @args = ($req_id, $request->{params});
+	push @args, $rpcswitch if $action->{meta};
 
 	local $@;
 	# fastest to slowest?
@@ -540,7 +569,7 @@ sub _magic {
 			$con->write($request);
 		};
 		eval {
-			$action->{cb}->($req_id, $params, $cb1, $cb2);
+			$action->{cb}->(@args, $cb1, $cb2);
 		};
 		if ($@) {
 			$cb1->(RES_ERROR, $@);
@@ -556,7 +585,7 @@ sub _magic {
 			$con->write($request);
 		};
 		eval {
-			$action->{cb}->($req_id, $params, $cb2);
+			$action->{cb}->(@args, $cb2);
 		};
 		if ($@) {
 			$cb1->(RES_ERROR, $@);
@@ -564,7 +593,7 @@ sub _magic {
 			$cb1->(RES_WAIT, $req_id);
 		}
 	} elsif ($action->{mode} eq 'sync') {
-		my @outargs = eval { $action->{cb}->($req_id, $params) };
+		my @outargs = eval { $action->{cb}->(@args) };
 		if ($@) {
 			$cb1->(RES_ERROR, $@);
 		} else {
@@ -581,7 +610,7 @@ sub _magic {
 			$con->write($request);
 		};
 		eval {
-			$self->_subproc($cb2, $action, $req_id, $params);
+			$self->_subproc($cb2, $action, @args);
 		};
 		if ($@) {
 			$cb1->(RES_ERROR, $@);
@@ -598,7 +627,7 @@ sub _subproc {
 	my ($self, $cb, $action, $req_id, @args) = @_;
 
 	# based on Mojo::IOLoop::Subprocess
-	my $ioloop = Mojo::IOLoop->singleton;
+	my $ioloop = $self->ioloop;
 
 	# Pipe for subprocess communication
 	pipe(my $reader, my $writer) or die "Can't create pipe: $!";
@@ -660,7 +689,7 @@ sub close {
 sub _loop {
 	warn __PACKAGE__." recursing into IO loop" if state $looping++;
 
-	my $reactor = Mojo::IOLoop->singleton->reactor;
+	my $reactor = $_[0]->ioloop->reactor;
 	my $err;
 
 	if (ref $reactor eq 'Mojo::Reactor::EV') {
@@ -779,6 +808,10 @@ Valid arguments are:
 when true expects the inargs to be valid json, when false a perl hashref is
 expected and json encoded.  (default true)
 
+=item - ioloop: L<Mojo::IOLoop> object to use
+
+(per default the L<Mojo::IOLoop>->singleton object is used)
+
 =item - log: L<Mojo::Log> object to use
 
 (per default a new L<Mojo::Log> object is created)
@@ -896,6 +929,9 @@ Valid arguments are:
 
 =item - cb: callback to be called for the method
 
+Default arguments are the request_id and the contents of the JSON-RPC 2.0
+params field.
+
 (required)
 
 =item - mode: callback mode
@@ -924,9 +960,17 @@ some Mojo-callbacks.
 
 (optional, default false)
 
-=item - undocb: a callback that gets called when the original callback
-returns an error object or throws an error.  Called with the same arguments
-as the original callback.
+=item - meta: pass RPC-Switch meta information
+
+The RPC-Switch meta information is passed to the callback as an extra
+argument after the JSON-RPC 2.0 params field.
+
+=item - undocb: undo on error
+
+A callback that gets called when the original callback
+returns an error object or throws an error.
+
+Called with the same arguments as the original callback.
 
 (optional, only valid for mode 'subproc')
 
@@ -966,9 +1010,9 @@ timeout).
 
 The RPC::Switch:Client library currently defines the following exit codes:
 
-        WORK_OK
-        WORK_PING_TIMEOUT
-        WORK_CONNECTION_CLOSED
+	WORK_OK
+	WORK_PING_TIMEOUT
+	WORK_CONNECTION_CLOSED
 
 =head2 stop
 
@@ -994,15 +1038,15 @@ Example:
   ./rpc-switch-client rpcswitch.get_methods '{}'
 
   ...
-        [
-          {
-            'foo.add' => 'adds 2 numbers'
-          },
-          {
-            'foo.div' => 'undocumented method'
-          },
+	[
+	  {
+	    'foo.add' => 'adds 2 numbers'
+	  },
+	  {
+	    'foo.div' => 'undocumented method'
+	  },
 	  ...
-        ];
+	];
 
 =item - B<rpcswitch.get_method_details>
 
@@ -1015,16 +1059,16 @@ Example:
   ./rpc-switch-client rpcswitch.get_method_details '{"method":"foo.add"}'
 
   ...
-        {
-          'doc' => {
-                     'description' => 'adds step to counter and returns counter; step defaults to 1',
-                     'outputs' => 'counter',
-                     'inputs' => 'counter, step'
-                   },
-          'b' => 'bar.add',
-          'd' => 'adds 2 numbers',
-          'c' => 'wieger'
-        }
+	{
+	  'doc' => {
+		     'description' => 'adds step to counter and returns counter; step defaults to 1',
+		     'outputs' => 'counter',
+		     'inputs' => 'counter, step'
+		   },
+	  'b' => 'bar.add',
+	  'd' => 'adds 2 numbers',
+	  'c' => 'wieger'
+	}
 
 =back
 
